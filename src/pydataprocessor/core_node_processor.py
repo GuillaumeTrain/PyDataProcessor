@@ -1,202 +1,114 @@
-import asyncio
+from abc import ABC, abstractmethod
 import pandas as pd
-from PyDataCore import DataPool
-from qasync import QEventLoop
-from PySide6.QtWidgets import QApplication
-import sys
-
-from tabulate import tabulate
+import asyncio
+from uuid import uuid4
 
 
-class NodePool:
-    def __init__(self, datapool: DataPool):
+class CoreProcessorBase(ABC):
+    def __init__(self, core_type, node_id, nodepool, datapool):
+        self.core_type = core_type
+        self.node_id = node_id
+        self.nodepool = nodepool
+        self.datapool = datapool
+        self.input_ports = []
+        self.output_ports = []
+        self.parameters = {}
+
+    def set_parameters(self, params):
+        """Sets the necessary parameters for this processing type."""
+        self.parameters.update(params)
+
+    def get_input_port_data(self, port_id, data_type):
+        """Adds an input port with data type checking."""
+        self.input_ports.append((port_id, data_type))
+
+    def add_output_port(self, port_id, data_type):
+        """Adds an output port and pre-declares its data in the datapool."""
+        self.output_ports.append((port_id, data_type))
+        data_id = str(uuid4())
+        self.datapool.register_data(data_type, port_id, self.node_id, in_file=False)
+
+    @abstractmethod
+    async def process(self):
+        """Define this method in each specific CoreProcessor."""
+        pass
+
+    def estimate_output_size(self):
+        """Estimate output size based on input size and processing type."""
+        input_data_sizes = [self.datapool.get_data_info(port[0])['data_object'].data_size_in_bytes
+                            for port in self.input_ports]
+        estimated_size = sum(input_data_sizes)  # Simple example, will vary by processing type
+        return estimated_size
+
+
+class CoreProcessorFactory:
+    @staticmethod
+    def create_processor(core_type, node_id, node_pool, datapool):
+        processors = {
+            "ProducerCore": ProducerCore,
+            "TransmitterCore": TransmitterCore,
+            "ConsumerCore": ConsumerCore
+        }
+
+        if core_type not in processors:
+            raise ValueError(f"Unsupported core type: {core_type}")
+
+        # Utilisation correcte sans passer `core_type`
+        return processors[core_type](node_id, node_pool, datapool)
+
+
+class AdditionCoreProcessor(CoreProcessorBase):
+    async def process(self):
+        print("AdditionCoreProcessor: Processing data for addition.")
+        input_data_1 = await self.nodepool.fetch_data_from_input(self.input_ports[0][0])
+        input_data_2 = await self.nodepool.fetch_data_from_input(self.input_ports[1][0])
+
+        if isinstance(input_data_1, list) and isinstance(input_data_2, list):
+            # Traitement direct si les données sont en RAM
+            result = [a + b for a, b in zip(input_data_1, input_data_2)]
+        else:
+            # Traitement par chunk si les données sont stockées en fichier
+            result = []
+            chunk_size = 1024  # Taille de chunk, paramètre ajustable
+            async for chunk_1, chunk_2 in zip(input_data_1, input_data_2):
+                chunk_result = [a + b for a, b in zip(chunk_1, chunk_2)]
+                result.extend(chunk_result)
+
+        output_port_id = self.output_ports[0][0]
+        self.datapool.store_data(output_port_id, result, self.node_id)
+        print(f"AdditionCoreProcessor: Stored data at output port {output_port_id}.")
+
+
+class CoreProcessor(ABC):
+    def __init__(self, node_id, node_pool, datapool):
+        self.node_id = node_id
+        self.node_pool = node_pool
         self.datapool = datapool
 
-        # Register to track each node, its type, processing status, and port states
-        self.nodes_register = pd.DataFrame(columns=[
-            'node_id', 'node_type', 'core', 'data_processed',
-            'input_ports_ready', 'output_ports_acknowledged',
-            'all_parameters_are_set'
-        ])
-
-        # Register to manage input ports with states and data linkage
-        self.input_ports_register = pd.DataFrame(columns=[
-            'node_id', 'port_number', 'port_id', 'data_type',
-            'source_port_id', 'data_processed'
-        ])
-
-        # Register to manage output ports with availability and subscribers
-        self.output_ports_register = pd.DataFrame(columns=[
-            'node_id', 'port_number', 'port_id', 'data_type',
-            'subscriber_port_id', 'data_available'
-        ])
-
-        # Register to track parameters for each node, their state, and values
-        self.parameters_register = pd.DataFrame(columns=[
-            'node_id', 'parameter_id', 'parameter_name',
-            'parameter_type', 'parameter_value', 'parameter_is_set'
-        ])
-
-    def add_node(self, node_id, node_type, core):
-        """Adds a node to the register and initializes its ports and parameters."""
-        self.nodes_register = pd.concat([
-            self.nodes_register,
-            pd.DataFrame([{
-                'node_id': node_id,
-                'node_type': node_type,
-                'core': core,
-                'data_processed': False,
-                'input_ports_ready': False,
-                'output_ports_acknowledged': False,
-                'all_parameters_are_set': False
-            }])
-        ], ignore_index=True)
-
-    def add_input_port(self, node_id, port_number, data_type, source_port_id=None):
-        """Adds an input port to the register and links to a data source if specified."""
-        port_id = f"{node_id}_input_{port_number}"
-        self.input_ports_register = pd.concat([
-            self.input_ports_register,
-            pd.DataFrame([{
-                'node_id': node_id,
-                'port_number': port_number,
-                'port_id': port_id,
-                'data_type': data_type,
-                'source_port_id': source_port_id,
-                'data_processed': False
-            }])
-        ], ignore_index=True)
-        return port_id
-
-    def add_output_port(self, node_id, port_number, data_type, subscriber_port_id=None):
-        """Adds an output port to the register and optionally assigns a subscriber."""
-        port_id = f"{node_id}_output_{port_number}"
-        self.output_ports_register = pd.concat([
-            self.output_ports_register,
-            pd.DataFrame([{
-                'node_id': node_id,
-                'port_number': port_number,
-                'port_id': port_id,
-                'data_type': data_type,
-                'subscriber_port_id': subscriber_port_id,
-                'data_available': False
-            }])
-        ], ignore_index=True)
-        return port_id
-
-    def add_parameter(self, node_id, parameter_id, parameter_name, parameter_type, parameter_value=None):
-        """Adds a parameter to the parameters register and sets initial state as not set."""
-        new_param = pd.DataFrame([{
-            'node_id': node_id,
-            'parameter_id': parameter_id,
-            'parameter_name': parameter_name,
-            'parameter_type': parameter_type,
-            'parameter_value': parameter_value,
-            'parameter_is_set': parameter_value is not None
-        }])
-
-        # Filter empty columns to avoid FutureWarning
-        self.parameters_register = pd.concat(
-            [self.parameters_register, new_param.dropna(axis=1, how='all')],
-            ignore_index=True
-        )
-
-    def update_parameter(self, node_id, parameter_name, value):
-        """Updates a parameter's value and sets its 'is_set' status to True."""
-        param_index = self.parameters_register[
-            (self.parameters_register['node_id'] == node_id) &
-            (self.parameters_register['parameter_name'] == parameter_name)
-            ].index
-
-        if not param_index.empty:
-            self.parameters_register.loc[param_index, 'parameter_value'] = value
-            self.parameters_register.loc[param_index, 'parameter_is_set'] = True
-            self._check_all_parameters_set(node_id)
-        else:
-            raise ValueError(f"Parameter {parameter_name} for node {node_id} not found")
-
-    def _check_all_parameters_set(self, node_id):
-        """Checks if all parameters for a node are set, and updates the node status."""
-        params = self.parameters_register[self.parameters_register['node_id'] == node_id]
-        all_set = params['parameter_is_set'].all()
-        self.nodes_register.loc[self.nodes_register['node_id'] == node_id, 'all_parameters_are_set'] = all_set
-
-    async def process_node(self, node_id):
-        """Processes a node if all input data is ready, parameters are set, and acknowledges output data."""
-        node_row = self.nodes_register[self.nodes_register['node_id'] == node_id]
-
-        if node_row['input_ports_ready'].values[0] and node_row['all_parameters_are_set'].values[0]:
-            core = node_row['core'].values[0]
-            await core.process()
-
-            # Update node status in register
-            self.nodes_register.loc[self.nodes_register['node_id'] == node_id, 'data_processed'] = True
-            self._acknowledge_output_ports(node_id)
-            self._update_port_status(node_id)  # Ensure ports are marked as ready/acknowledged
-
-    def _acknowledge_output_ports(self, node_id):
-        """Marks all output ports of a node as acknowledged."""
-        output_ports = self.output_ports_register[self.output_ports_register['node_id'] == node_id]
-        for port_id in output_ports['port_id']:
-            self.output_ports_register.loc[self.output_ports_register['port_id'] == port_id, 'data_available'] = True
-        self.nodes_register.loc[self.nodes_register['node_id'] == node_id, 'output_ports_acknowledged'] = True
-
-    def _update_port_status(self, node_id):
-        """Marks input ports as ready and output ports as acknowledged after processing."""
-        self.nodes_register.loc[self.nodes_register['node_id'] == node_id, 'input_ports_ready'] = True
-        self.nodes_register.loc[self.nodes_register['node_id'] == node_id, 'output_ports_acknowledged'] = True
-
-    def remove_node(self, node_id):
-        """Removes a node and its associated ports and parameters from all registers."""
-        self.nodes_register = self.nodes_register[self.nodes_register['node_id'] != node_id]
-        self.input_ports_register = self.input_ports_register[self.input_ports_register['node_id'] != node_id]
-        self.output_ports_register = self.output_ports_register[self.output_ports_register['node_id'] != node_id]
-        self.parameters_register = self.parameters_register[self.parameters_register['node_id'] != node_id]
-
-    def connect_ports(self, output_port_id, input_port_id):
+    @abstractmethod
+    async def process(self, input_data=None):
         """
-        Connects an output port to an input port. Updates the subscriber list of the output port and sets the
-        source port ID for the input port.
+        Cette méthode sera implémentée par chaque type de Core spécifique.
+        - ProducerCore : Génère et enregistre les données.
+        - TransmitterCore : Transmet des données d'entrée à une sortie.
+        - ConsumerCore : Consomme les données d'entrée.
         """
-        # Update input port to link it to the output port
-        self.input_ports_register.loc[
-            self.input_ports_register['port_id'] == input_port_id, 'source_port_id'
-        ] = output_port_id
+        pass
 
-        # Find if output port already has a subscriber
-        output_row = self.output_ports_register[self.output_ports_register['port_id'] == output_port_id]
 
-        if not output_row.empty and pd.notnull(output_row['subscriber_port_id']).all():
-            # If output port already has subscribers, add a new row for the new subscriber
-            new_row = output_row.iloc[0].copy()
-            new_row['subscriber_port_id'] = input_port_id
-            self.output_ports_register = pd.concat(
-                [self.output_ports_register, pd.DataFrame([new_row])], ignore_index=True
-            )
-        else:
-            # If output port has no subscribers, set the subscriber ID directly
-            self.output_ports_register.loc[
-                self.output_ports_register['port_id'] == output_port_id, 'subscriber_port_id'
-            ] = input_port_id
+class ProducerCore(CoreProcessor):
+    async def process(self):
+        print("ProducerCore: Producing data...")
+        return [1, 2, 3, 4, 5]
 
-    def print_input_ports_register(self):
-        print(tabulate(self.input_ports_register, headers='keys', tablefmt='pretty'))
 
-    def print_output_ports_register(self):
-        print(tabulate(self.output_ports_register, headers='keys', tablefmt='pretty'))
+class TransmitterCore(CoreProcessor):
+    async def process(self, input_data):
+        print("TransmitterCore: Transmitting data...")
+        return input_data
 
-    def print_node_register(self):
-        print(tabulate(self.nodes_register, headers='keys', tablefmt='pretty'))
 
-    def print_parameters_register(self):
-        print(tabulate(self.parameters_register, headers='keys', tablefmt='pretty'))
+class ConsumerCore(CoreProcessor):
+    async def process(self, input_data):
+        print(f"ConsumerCore: Consuming data: {input_data}")
 
-    def print_all_registers(self):
-        print("Input Ports Register:")
-        self.print_input_ports_register()
-        print("\nOutput Ports Register:")
-        self.print_output_ports_register()
-        print("\nNode Register:")
-        self.print_node_register()
-        print("\nParameters Register:")
-        self.print_parameters_register()
